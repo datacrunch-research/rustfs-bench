@@ -36,7 +36,7 @@ struct Args {
     /// CUDA device index for --mem gpu (also the NIXL device id)
     #[arg(long, default_value_t = 0)]
     gpu: i32,
-    /// UCX devices for the agent, for example mlx5_9:1 (empty: every device)
+    /// UCX device names for the agent, for example mlx5_9 (empty: every device)
     #[arg(long, default_value = "")]
     devices: String,
     /// This client's NIXL agent name (unique per process)
@@ -192,9 +192,13 @@ async fn request(
         .get("x-amz-rdma-bytes-transferred")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
-    let content_length = resp.content_length();
+    let content_length = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
     let body = resp.bytes().await.context("reading body")?.to_vec();
-    let body_len = content_length.map_or(body.len(), |len| len as usize);
+    let body_len = content_length.unwrap_or(body.len());
     Ok((
         Reply {
             status,
@@ -224,7 +228,7 @@ async fn main() -> Result<()> {
     }
     let size = head.body_len;
     if size == 0 {
-        bail!("object is empty");
+        bail!("HEAD returned no Content-Length or an empty object");
     }
 
     let agent_name = if args.agent.is_empty() {

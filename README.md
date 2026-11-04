@@ -18,7 +18,7 @@ NIXL_PREFIX=/opt/nvidia/nvda_nixl cargo build --release
 # run: the NIXL libraries and the UCX plugin must be on the library path
 export LD_LIBRARY_PATH=$NIXL_PREFIX/lib:/usr/local/cuda/lib64 NIXL_PLUGIN_DIR=$NIXL_PREFIX/lib/plugins
 nixl-get --endpoint http://10.20.9.57:9000 --bucket models --key bench/rand-2g-s4m.bin \
-  --mem gpu --gpu 4 --devices mlx5_9:1 --rounds 3 --verify
+  --mem gpu --gpu 4 --devices mlx5_9 --rounds 3 --verify
 ```
 
 `--devices` names the UCX devices (the NIC next to the target GPU); `--mem host`
