@@ -51,6 +51,10 @@ struct Args {
     /// Send the agent metadata on every round (default: first round only)
     #[arg(long)]
     metadata_every_round: bool,
+    /// Wait until this Unix time (seconds) before the first round, so several
+    /// processes start together and their wall clocks can be compared
+    #[arg(long)]
+    start_at: Option<f64>,
     #[arg(long, default_value = "rustfsadmin")]
     access_key: String,
     #[arg(long, default_value = "rustfsadmin")]
@@ -260,6 +264,23 @@ async fn main() -> Result<()> {
         metadata.len()
     );
 
+    if let Some(start_at) = args.start_at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        if start_at > now {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(start_at - now)).await;
+        }
+    }
+    let epoch = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    };
+    let first_start = epoch();
+    let mut last_end = first_start;
     let mut last = None;
     for round in 0..args.rounds {
         let mut extra = vec![
@@ -284,6 +305,7 @@ async fn main() -> Result<()> {
             bail!("the server did not serve the GET over RDMA (reply {:?}, moved {moved})", reply.rdma_reply);
         }
         last = Some(seconds);
+        last_end = epoch();
     }
 
     let mut verified = None;
@@ -298,11 +320,13 @@ async fn main() -> Result<()> {
     }
     let seconds = last.unwrap_or(0.0);
     println!(
-        "RESULT {} size={size} seconds={seconds:.3} GBps={:.2} mem={} verified={}",
+        "RESULT {} size={size} seconds={seconds:.3} GBps={:.2} mem={} verified={} rounds={} start={first_start:.3} end={:.3}",
         if verified != Some(false) { "OK" } else { "MISMATCH" },
         size as f64 / seconds / 1e9,
         args.mem,
-        verified.map_or("skipped".to_owned(), |v| v.to_string())
+        verified.map_or("skipped".to_owned(), |v| v.to_string()),
+        args.rounds,
+        last_end
     );
     if verified == Some(false) {
         std::process::exit(2);
