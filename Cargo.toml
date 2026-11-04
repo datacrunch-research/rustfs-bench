@@ -1,0 +1,29 @@
+[package]
+name = "rustfs-bench"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Client-side benchmarks for RustFS S3-over-RDMA on NIXL/UCX: GETs into GPU or host memory"
+license = "Apache-2.0"
+
+[[bin]]
+name = "nixl-get"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+hmac = "0.12"
+libloading = "0.8"
+md-5 = "0.10"
+nixl-sys = { git = "https://github.com/ai-dynamo/nixl", tag = "v1.5.2" }
+reqwest = { version = "0.12", default-features = false, features = ["http2"] }
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+url = "2"
+
+[profile.release]
+debug = 1
