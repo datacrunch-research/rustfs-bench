@@ -339,6 +339,34 @@ async fn main() -> Result<()> {
                 first,
                 ours.len().div_ceil(BLOCK)
             );
+            // Provenance of the wrong blocks: which block of the object (if any) each one holds.
+            let reference: std::collections::HashMap<[u8; 16], usize> = body
+                .chunks(BLOCK)
+                .enumerate()
+                .map(|(index, block)| (Md5::digest(block).into(), index))
+                .collect();
+            let mut shown = 0usize;
+            let mut from_object = 0usize;
+            let mut unknown = 0usize;
+            let mut listing = String::new();
+            for (index, (a, b)) in ours.chunks(BLOCK).zip(body.chunks(BLOCK)).enumerate() {
+                if a == b || a.iter().all(|&x| x == 0) {
+                    continue;
+                }
+                let source = reference.get::<[u8; 16]>(&Md5::digest(a).into()).copied();
+                match source {
+                    Some(_) => from_object += 1,
+                    None => unknown += 1,
+                }
+                if shown < 32 {
+                    listing.push_str(&format!(
+                        " {index}<-{}",
+                        source.map_or("?".to_owned(), |s| s.to_string())
+                    ));
+                    shown += 1;
+                }
+            }
+            println!("MISMATCH wrong_blocks_from_object={from_object} wrong_blocks_unknown={unknown} first:{listing}");
         }
         if !same {
             // Does the copy become correct later? Then the server replied before the data landed.

@@ -24,3 +24,26 @@ nixl-get --endpoint http://10.20.9.57:9000 --bucket models --key bench/rand-2g-s
 `--devices` names the UCX devices (the NIC next to the target GPU); `--mem host`
 lands in page-aligned host memory. Requires a RustFS server built with the
 `nixl` feature and `RUSTFS_NIXL_ENABLE=true`.
+
+## nixl-reuse
+
+A standalone NIXL staging-chunk reuse test with no RustFS in the loop. `target`
+registers a zeroed host buffer and publishes its agent metadata through a shared
+directory; `writer` fills the buffer with 16 MiB WRITE transfers from a small
+pool of chunks, refilling each chunk as soon as NIXL reports its transfer
+complete, as the RustFS emit path does. The target then checks every 8-byte
+word against its own offset and lists which offsets' data landed in the wrong
+place.
+
+```bash
+# on the receiving node
+nixl-reuse --id r1 --devices mlx5_11 target --size 2147483648
+# on the sending node
+nixl-reuse --id r1 --devices mlx5_11 writer --pool 8 --threads 8
+```
+
+Note that `Agent::post_xfer_req` in the `nixl-sys` binding returns `true`
+while the transfer is still in progress and `false` when it completed before
+returning; reading it the other way reports every transfer complete at post
+time, which this test was written to catch.
+
