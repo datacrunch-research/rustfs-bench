@@ -24,7 +24,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use nixl_sys::{Agent, AgentConfig, MemType, MemoryRegion, NixlDescriptor, OptArgs, Params, ThreadSync, XferDescList, XferOp, XferStatus};
+use nixl_sys::{
+    Agent, AgentConfig, MemType, MemoryRegion, NixlDescriptor, OptArgs, Params, ThreadSync,
+    XferDescList, XferOp, XferStatus,
+};
 use std::alloc::Layout;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -99,7 +102,11 @@ impl HostBuffer {
         if ptr.is_null() {
             bail!("host allocation of {len} bytes failed");
         }
-        Ok(Self { addr: ptr as usize, len, layout })
+        Ok(Self {
+            addr: ptr as usize,
+            len,
+            layout,
+        })
     }
 
     fn slice_mut(&self, offset: usize, len: usize) -> &mut [u8] {
@@ -151,16 +158,34 @@ fn fill_pattern(buf: &mut [u8], offset: usize) {
     }
 }
 
-fn make_agent(name: &str, devices: &str, sync: ThreadSync, num_workers: u32, prog_thread: bool) -> Result<(Agent, OptArgs)> {
-    let config = AgentConfig { thread_sync: sync, num_workers, enable_prog_thread: prog_thread, ..AgentConfig::default() };
+fn make_agent(
+    name: &str,
+    devices: &str,
+    sync: ThreadSync,
+    num_workers: u32,
+    prog_thread: bool,
+) -> Result<(Agent, OptArgs)> {
+    let config = AgentConfig {
+        thread_sync: sync,
+        num_workers,
+        enable_prog_thread: prog_thread,
+        ..AgentConfig::default()
+    };
     let agent = Agent::new_configured(name, &config).map_err(|e| anyhow!("agent: {e}"))?;
-    let mut params = Params::from(std::iter::empty::<(&str, &str)>()).map_err(|e| anyhow!("params: {e}"))?;
+    let mut params =
+        Params::from(std::iter::empty::<(&str, &str)>()).map_err(|e| anyhow!("params: {e}"))?;
     if !devices.is_empty() {
-        params.set("device_list", devices).map_err(|e| anyhow!("device_list: {e}"))?;
+        params
+            .set("device_list", devices)
+            .map_err(|e| anyhow!("device_list: {e}"))?;
     }
-    let backend = agent.create_backend("UCX", &params).map_err(|e| anyhow!("ucx backend: {e}"))?;
+    let backend = agent
+        .create_backend("UCX", &params)
+        .map_err(|e| anyhow!("ucx backend: {e}"))?;
     let mut opt_args = OptArgs::new().map_err(|e| anyhow!("opt args: {e}"))?;
-    opt_args.add_backend(&backend).map_err(|e| anyhow!("opt args: {e}"))?;
+    opt_args
+        .add_backend(&backend)
+        .map_err(|e| anyhow!("opt args: {e}"))?;
     Ok((agent, opt_args))
 }
 
@@ -170,14 +195,23 @@ fn target(args: &Args, size: usize) -> Result<()> {
     // connection handshake (the `nixl-get` client gets the same from `Agent::new`).
     let (agent, opt_args) = make_agent(&name, &args.devices, ThreadSync::Rw, 1, true)?;
     let buffer = HostBuffer::new(size)?;
-    let _registration = agent.register_memory(&buffer, Some(&opt_args)).map_err(|e| anyhow!("register: {e}"))?;
+    let _registration = agent
+        .register_memory(&buffer, Some(&opt_args))
+        .map_err(|e| anyhow!("register: {e}"))?;
     let metadata = agent.get_local_md().map_err(|e| anyhow!("metadata: {e}"))?;
     std::fs::create_dir_all(&args.dir)?;
     let base = args.dir.join(&args.id);
     let _ = std::fs::remove_file(base.with_extension("done"));
     std::fs::write(base.with_extension("meta"), &metadata)?;
-    std::fs::write(base.with_extension("target"), format!("{name}\n{}\n{}\n", buffer.addr, buffer.len))?;
-    println!("target {name}: {size} bytes at {:#x}, metadata {} bytes; waiting for the writer", buffer.addr, metadata.len());
+    std::fs::write(
+        base.with_extension("target"),
+        format!("{name}\n{}\n{}\n", buffer.addr, buffer.len),
+    )?;
+    println!(
+        "target {name}: {size} bytes at {:#x}, metadata {} bytes; waiting for the writer",
+        buffer.addr,
+        metadata.len()
+    );
     let started = Instant::now();
     while !base.with_extension("done").exists() {
         if started.elapsed() > Duration::from_secs(600) {
@@ -263,7 +297,9 @@ fn writer(
     let _registration = agent
         .register_memory(pool_buffer.as_ref(), Some(&opt_args))
         .map_err(|e| anyhow!("register pool: {e}"))?;
-    let loaded = agent.load_remote_md(&metadata).map_err(|e| anyhow!("load remote: {e}"))?;
+    let loaded = agent
+        .load_remote_md(&metadata)
+        .map_err(|e| anyhow!("load remote: {e}"))?;
     if loaded != remote_name {
         bail!("metadata names {loaded}, file names {remote_name}");
     }
@@ -271,7 +307,13 @@ fn writer(
         "writer {name}: target {remote_name} {remote_len} bytes at {remote_addr:#x}; chunk {chunk}, pool {pool}, threads {threads}, sync {sync:?}, workers {num_workers}, rounds {rounds}"
     );
     if !probe.is_empty() {
-        probe_endpoint(&agent, &pool_buffer, remote_addr, &remote_name, probe == "write")?;
+        probe_endpoint(
+            &agent,
+            &pool_buffer,
+            remote_addr,
+            &remote_name,
+            probe == "write",
+        )?;
     }
     let threads = threads.clamp(1, pool);
     let total_chunks = remote_len.div_ceil(chunk);
@@ -366,14 +408,24 @@ fn writer(
     }
     let seconds = started.elapsed().as_secs_f64();
     std::fs::write(base.with_extension("done"), "done")?;
-    println!("WRITER moved={moved} seconds={seconds:.3} GBps={:.2}", moved as f64 / seconds / 1e9);
+    println!(
+        "WRITER moved={moved} seconds={seconds:.3} GBps={:.2}",
+        moved as f64 / seconds / 1e9
+    );
     // Keep the agent alive long enough for the target to verify before the endpoint goes away.
     std::thread::sleep(Duration::from_secs(2));
     Ok(())
 }
 
 /// One transfer, waited to completion as NIXL reports it.
-fn one_transfer(agent: &Agent, op: XferOp, local_addr: usize, remote_addr: usize, len: usize, remote_name: &str) -> Result<()> {
+fn one_transfer(
+    agent: &Agent,
+    op: XferOp,
+    local_addr: usize,
+    remote_addr: usize,
+    len: usize,
+    remote_name: &str,
+) -> Result<()> {
     let mut local = XferDescList::new(MemType::Dram).map_err(|e| anyhow!("local list: {e}"))?;
     local.add_desc(local_addr, len, 0);
     let mut remote = XferDescList::new(MemType::Dram).map_err(|e| anyhow!("remote list: {e}"))?;
@@ -381,11 +433,17 @@ fn one_transfer(agent: &Agent, op: XferOp, local_addr: usize, remote_addr: usize
     let req = agent
         .create_xfer_req(op, &local, &remote, remote_name, None)
         .map_err(|e| anyhow!("create: {e}"))?;
-    if !agent.post_xfer_req(&req, None).map_err(|e| anyhow!("post: {e}"))? {
+    if !agent
+        .post_xfer_req(&req, None)
+        .map_err(|e| anyhow!("post: {e}"))?
+    {
         return Ok(());
     }
     loop {
-        match agent.get_xfer_status(&req).map_err(|e| anyhow!("status: {e}"))? {
+        match agent
+            .get_xfer_status(&req)
+            .map_err(|e| anyhow!("status: {e}"))?
+        {
             XferStatus::Success => return Ok(()),
             XferStatus::InProgress => std::thread::yield_now(),
         }
@@ -394,7 +452,13 @@ fn one_transfer(agent: &Agent, op: XferOp, local_addr: usize, remote_addr: usize
 
 /// Repeats small transfers on the endpoint until one provably moved data, and
 /// reports how many "completed" transfers it took.
-fn probe_endpoint(agent: &Agent, pool: &HostBuffer, remote_addr: usize, remote_name: &str, write: bool) -> Result<()> {
+fn probe_endpoint(
+    agent: &Agent,
+    pool: &HostBuffer,
+    remote_addr: usize,
+    remote_name: &str,
+    write: bool,
+) -> Result<()> {
     const PAGE: usize = 4096;
     let started = Instant::now();
     let mut attempts = 0usize;
@@ -405,22 +469,53 @@ fn probe_endpoint(agent: &Agent, pool: &HostBuffer, remote_addr: usize, remote_n
             // filled with something else.
             let pattern = pool.slice_mut(0, PAGE);
             pattern.fill(0xC0 | (attempts as u8 & 0x0f));
-            one_transfer(agent, XferOp::Write, pool.addr, remote_addr, PAGE, remote_name)?;
+            one_transfer(
+                agent,
+                XferOp::Write,
+                pool.addr,
+                remote_addr,
+                PAGE,
+                remote_name,
+            )?;
             let back = pool.slice_mut(PAGE, PAGE);
             back.fill(0x11);
-            one_transfer(agent, XferOp::Read, pool.addr + PAGE, remote_addr, PAGE, remote_name)?;
+            one_transfer(
+                agent,
+                XferOp::Read,
+                pool.addr + PAGE,
+                remote_addr,
+                PAGE,
+                remote_name,
+            )?;
             pool.slice(0, PAGE) == pool.slice(PAGE, PAGE)
         } else {
             // Read the target's first page twice into chunks filled differently;
             // two real reads agree, two deferred reads leave the fillers.
             pool.slice_mut(0, PAGE).fill(0xAA);
             pool.slice_mut(PAGE, PAGE).fill(0x55);
-            one_transfer(agent, XferOp::Read, pool.addr, remote_addr, PAGE, remote_name)?;
-            one_transfer(agent, XferOp::Read, pool.addr + PAGE, remote_addr, PAGE, remote_name)?;
+            one_transfer(
+                agent,
+                XferOp::Read,
+                pool.addr,
+                remote_addr,
+                PAGE,
+                remote_name,
+            )?;
+            one_transfer(
+                agent,
+                XferOp::Read,
+                pool.addr + PAGE,
+                remote_addr,
+                PAGE,
+                remote_name,
+            )?;
             pool.slice(0, PAGE) == pool.slice(PAGE, PAGE)
         };
         if live {
-            println!("PROBE live after {attempts} attempts, {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+            println!(
+                "PROBE live after {attempts} attempts, {:.1} ms",
+                started.elapsed().as_secs_f64() * 1e3
+            );
             return Ok(());
         }
         if started.elapsed() > Duration::from_secs(10) {
@@ -434,8 +529,27 @@ fn main() -> Result<()> {
     let args = Args::parse();
     match &args.role {
         Role::Target { size } => target(&args, *size),
-        Role::Writer { chunk, pool, threads, sync, num_workers, rounds, refill_delay_us, probe, prog_thread } => {
-            writer(&args, *chunk, *pool, *threads, sync, *num_workers, *rounds, *refill_delay_us, probe, *prog_thread)
-        }
+        Role::Writer {
+            chunk,
+            pool,
+            threads,
+            sync,
+            num_workers,
+            rounds,
+            refill_delay_us,
+            probe,
+            prog_thread,
+        } => writer(
+            &args,
+            *chunk,
+            *pool,
+            *threads,
+            sync,
+            *num_workers,
+            *rounds,
+            *refill_delay_us,
+            probe,
+            *prog_thread,
+        ),
     }
 }

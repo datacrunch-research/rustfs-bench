@@ -47,3 +47,16 @@ while the transfer is still in progress and `false` when it completed before
 returning; reading it the other way reports every transfer complete at post
 time, which this test was written to catch.
 
+## PUT
+
+`nixl-get --op put` uploads a registered host or GPU buffer as a multipart
+object whose parts the server pulls over NIXL: each UploadPart carries an
+empty body and the NIXL headers, with `x-rustfs-nixl-buffer` naming that
+part's slice of the buffer. The buffer holds deterministic pseudo-random
+data; `--verify` reads the stored object back over plain HTTP and compares.
+
+```bash
+nixl-get --op put --endpoint http://10.20.9.28:9000 --bucket models --key bench/put-0.bin \
+  --size 4294967296 --part-size 100663296 --parallel 8 --mem gpu --gpu 0 --devices mlx5_0 --verify
+```
+
