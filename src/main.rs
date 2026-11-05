@@ -316,6 +316,39 @@ async fn main() -> Result<()> {
         }
         let ours = buffer.to_host()?;
         let same = Md5::digest(&ours) == Md5::digest(&body);
+        if !same {
+            // Where and how the copies differ: never-written (still zero) or stale/wrong bytes, per 1 MiB block.
+            const BLOCK: usize = 1 << 20;
+            let mut first = None;
+            let mut zero_blocks = 0usize;
+            let mut wrong_blocks = 0usize;
+            for (index, (a, b)) in ours.chunks(BLOCK).zip(body.chunks(BLOCK)).enumerate() {
+                if a != b {
+                    if first.is_none() {
+                        first = Some(index * BLOCK + a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(0));
+                    }
+                    if a.iter().all(|&x| x == 0) {
+                        zero_blocks += 1;
+                    } else {
+                        wrong_blocks += 1;
+                    }
+                }
+            }
+            println!(
+                "MISMATCH first_offset={:?} zero_1MiB_blocks={zero_blocks} wrong_1MiB_blocks={wrong_blocks} of {}",
+                first,
+                ours.len().div_ceil(BLOCK)
+            );
+        }
+        if !same {
+            // Does the copy become correct later? Then the server replied before the data landed.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let again = buffer.to_host()?;
+            println!(
+                "MISMATCH recheck_after_2s={}",
+                if Md5::digest(&again) == Md5::digest(&body) { "matches_now" } else { "still_wrong" }
+            );
+        }
         verified = Some(same);
     }
     let seconds = last.unwrap_or(0.0);
