@@ -823,6 +823,7 @@ async fn run_put_objects(
     let mut last_end = first_start;
     let mut last = None;
     let mut latencies_ms = Vec::with_capacity(count * args.rounds);
+    let mut etags: Vec<Option<String>> = vec![None; count];
     for round in 0..args.rounds {
         let started = Instant::now();
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(args.parallel.max(1)));
@@ -866,11 +867,17 @@ async fn run_put_objects(
                         String::from_utf8_lossy(&body)
                     );
                 }
-                Ok::<_, anyhow::Error>(object_started.elapsed().as_secs_f64() * 1000.0)
+                Ok::<_, anyhow::Error>((
+                    index,
+                    object_started.elapsed().as_secs_f64() * 1000.0,
+                    reply.etag,
+                ))
             });
         }
         while let Some(done) = tasks.join_next().await {
-            latencies_ms.push(done??);
+            let (index, latency_ms, etag) = done??;
+            latencies_ms.push(latency_ms);
+            etags[index] = etag;
         }
         let seconds = started.elapsed().as_secs_f64();
         println!(
@@ -906,15 +913,23 @@ async fn run_put_objects(
             });
         }
         let mut wrong = 0usize;
+        let mut wrong_etags = 0usize;
         while let Some(done) = tasks.join_next().await {
             let (index, status, body) = done??;
-            if status != 200 || body.as_slice() != &ours[index * size..(index + 1) * size] {
+            let slice = &ours[index * size..(index + 1) * size];
+            if status != 200 || body.as_slice() != slice {
                 wrong += 1;
+                same = false;
+            }
+            // The PUT's ETag must be the MD5 of the object's bytes.
+            let expected = format!("\"{}\"", hex_string(&Md5::digest(slice)));
+            if etags[index].as_deref() != Some(expected.as_str()) {
+                wrong_etags += 1;
                 same = false;
             }
         }
         if !same {
-            println!("MISMATCH wrong_objects={wrong} of {count}");
+            println!("MISMATCH wrong_objects={wrong} wrong_etags={wrong_etags} of {count}");
         }
         verified = Some(same);
     }
@@ -1119,4 +1134,9 @@ async fn run_get_objects(
         std::process::exit(2);
     }
     Ok(())
+}
+
+/// Lower-case hex of `bytes`.
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
