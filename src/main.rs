@@ -62,16 +62,21 @@ struct Args {
     #[arg(long, default_value = "us-east-1")]
     region: String,
     /// `get` reads the object into the buffer; `put` uploads the buffer as the
-    /// object (multipart, the server pulls every part over NIXL)
+    /// object (multipart, the server pulls every part over NIXL); `put-objects`
+    /// uploads `--count` objects of `--size` bytes as single PutObjects;
+    /// `get-objects` reads them back over NIXL
     #[arg(long, default_value = "get")]
     op: String,
     /// PUT: object size in bytes
     #[arg(long, default_value_t = 2 << 30)]
     size: usize,
+    /// put-objects: number of objects (keys `<key>-<index>`)
+    #[arg(long, default_value_t = 1)]
+    count: usize,
     /// PUT: multipart part size in bytes (96 MiB = two 12+4 stripes of 4 MiB shards)
     #[arg(long, default_value_t = 96 << 20)]
     part_size: usize,
-    /// PUT: parts in flight
+    /// PUT: parts in flight; put-objects: objects in flight
     #[arg(long, default_value_t = 8)]
     parallel: usize,
 }
@@ -263,6 +268,12 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::builder().build()?;
     if args.op == "put" {
         return run_put(&args, &client, &creds, &url).await;
+    }
+    if args.op == "put-objects" {
+        return run_put_objects(&args, &client, &creds, &url).await;
+    }
+    if args.op == "get-objects" {
+        return run_get_objects(&args, &client, &creds, &url).await;
     }
 
     let (head, _) = request(&client, &creds, "HEAD", &url, &[]).await?;
@@ -724,6 +735,382 @@ async fn run_put(
         "RESULT {} op=put size={size} seconds={seconds:.3} GBps={:.2} mem={} verified={} rounds={} start={first_start:.3} end={last_end:.3}",
         if verified != Some(false) { "OK" } else { "MISMATCH" },
         size as f64 / seconds / 1e9,
+        args.mem,
+        verified.map_or("skipped".to_owned(), |v| v.to_string()),
+        args.rounds,
+    );
+    if verified == Some(false) {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+/// put-objects: uploads `--count` objects of `--size` bytes, each a single
+/// PutObject whose body the server pulls over NIXL from its own slice of one
+/// registered buffer, with `--parallel` objects in flight.
+async fn run_put_objects(
+    args: &Args,
+    client: &reqwest::Client,
+    creds: &sigv4::Credentials,
+    url: &Url,
+) -> Result<()> {
+    let (size, count) = (args.size, args.count);
+    if size == 0 || count == 0 || size % 8 != 0 {
+        bail!("--size must be a positive multiple of 8 and --count positive");
+    }
+    let total = size * count;
+    let agent_name = if args.agent.is_empty() {
+        format!("nixl-puts-{}", std::process::id())
+    } else {
+        args.agent.clone()
+    };
+    let agent = Agent::new(&agent_name).map_err(|e| anyhow!("agent: {e}"))?;
+    let mut params =
+        Params::from(std::iter::empty::<(&str, &str)>()).map_err(|e| anyhow!("params: {e}"))?;
+    if !args.devices.is_empty() {
+        params
+            .set("device_list", &args.devices)
+            .map_err(|e| anyhow!("device_list: {e}"))?;
+    }
+    let backend = agent
+        .create_backend("UCX", &params)
+        .map_err(|e| anyhow!("ucx backend: {e}"))?;
+    let mut opt_args = OptArgs::new().map_err(|e| anyhow!("opt args: {e}"))?;
+    opt_args
+        .add_backend(&backend)
+        .map_err(|e| anyhow!("opt args: {e}"))?;
+    let buffer = match args.mem.as_str() {
+        "gpu" | "vram" => Buffer::gpu(total, args.gpu)?,
+        _ => Buffer::host(total)?,
+    };
+    fill_buffer(&buffer)?;
+    let _registration = agent
+        .register_memory(&buffer, Some(&opt_args))
+        .map_err(|e| anyhow!("register memory: {e}"))?;
+    let metadata = base64::engine::general_purpose::STANDARD
+        .encode(agent.get_local_md().map_err(|e| anyhow!("metadata: {e}"))?);
+    let kind = if matches!(buffer.mem_type, MemType::Vram) {
+        "vram"
+    } else {
+        "dram"
+    };
+    let object_url = |index: usize| -> Result<Url> {
+        let base = url.as_str().trim_end_matches('/');
+        Ok(Url::parse(&format!("{base}-{index:05}"))?)
+    };
+    eprintln!(
+        "{count} objects of {size} bytes, {} in flight, agent {agent_name}, buffer {}",
+        args.parallel,
+        buffer.header()
+    );
+
+    if let Some(start_at) = args.start_at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        if start_at > now {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(start_at - now)).await;
+        }
+    }
+    let epoch = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    };
+    let first_start = epoch();
+    let mut last_end = first_start;
+    let mut last = None;
+    let mut latencies_ms = Vec::with_capacity(count * args.rounds);
+    for round in 0..args.rounds {
+        let started = Instant::now();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(args.parallel.max(1)));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..count {
+            let permit = std::sync::Arc::clone(&semaphore).acquire_owned().await?;
+            let target = object_url(index)?;
+            let extra = vec![
+                ("x-rustfs-nixl-agent".to_owned(), agent_name.clone()),
+                ("x-rustfs-nixl-metadata".to_owned(), metadata.clone()),
+                (
+                    "x-rustfs-nixl-buffer".to_owned(),
+                    format!(
+                        "{kind}:{}:{:#x}:{size}",
+                        buffer.device,
+                        buffer.addr + index * size
+                    ),
+                ),
+            ];
+            let (client, creds) = (
+                client.clone(),
+                sigv4::Credentials {
+                    access_key: creds.access_key.clone(),
+                    secret_key: creds.secret_key.clone(),
+                    region: creds.region.clone(),
+                },
+            );
+            tasks.spawn(async move {
+                let _permit = permit;
+                let object_started = Instant::now();
+                let (reply, body) = request(&client, &creds, "PUT", &target, &extra).await?;
+                if reply.status != 200
+                    || reply.rdma_reply.as_deref() != Some("200")
+                    || reply.transferred != Some(size as u64)
+                {
+                    bail!(
+                        "PutObject {index} returned {} (rdma reply {:?}, moved {:?}): {}",
+                        reply.status,
+                        reply.rdma_reply,
+                        reply.transferred,
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                Ok::<_, anyhow::Error>(object_started.elapsed().as_secs_f64() * 1000.0)
+            });
+        }
+        while let Some(done) = tasks.join_next().await {
+            latencies_ms.push(done??);
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        println!(
+            "round {round}: objects={count} seconds={seconds:.3} GBps={:.2} objects_per_s={:.0}",
+            total as f64 / seconds / 1e9,
+            count as f64 / seconds
+        );
+        last = Some(seconds);
+        last_end = epoch();
+    }
+
+    let mut verified = None;
+    if args.verify {
+        let ours = buffer.to_host()?;
+        let mut same = true;
+        let mut tasks = tokio::task::JoinSet::new();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(args.parallel.max(1)));
+        for index in 0..count {
+            let permit = std::sync::Arc::clone(&semaphore).acquire_owned().await?;
+            let target = object_url(index)?;
+            let (client, creds) = (
+                client.clone(),
+                sigv4::Credentials {
+                    access_key: creds.access_key.clone(),
+                    secret_key: creds.secret_key.clone(),
+                    region: creds.region.clone(),
+                },
+            );
+            tasks.spawn(async move {
+                let _permit = permit;
+                let (reply, body) = request(&client, &creds, "GET", &target, &[]).await?;
+                Ok::<_, anyhow::Error>((index, reply.status, body))
+            });
+        }
+        let mut wrong = 0usize;
+        while let Some(done) = tasks.join_next().await {
+            let (index, status, body) = done??;
+            if status != 200 || body.as_slice() != &ours[index * size..(index + 1) * size] {
+                wrong += 1;
+                same = false;
+            }
+        }
+        if !same {
+            println!("MISMATCH wrong_objects={wrong} of {count}");
+        }
+        verified = Some(same);
+    }
+    latencies_ms.sort_by(f64::total_cmp);
+    let percentile = |p: f64| {
+        latencies_ms
+            .get(((latencies_ms.len() as f64 - 1.0) * p).round() as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let seconds = last.unwrap_or(0.0);
+    println!(
+        "RESULT {} op=put-objects size={total} objects={count} object_size={size} seconds={seconds:.3} GBps={:.2} objects_per_s={:.0} p50_ms={:.1} p99_ms={:.1} mem={} verified={} rounds={} start={first_start:.3} end={last_end:.3}",
+        if verified != Some(false) { "OK" } else { "MISMATCH" },
+        total as f64 / seconds / 1e9,
+        count as f64 / seconds,
+        percentile(0.5),
+        percentile(0.99),
+        args.mem,
+        verified.map_or("skipped".to_owned(), |v| v.to_string()),
+        args.rounds,
+    );
+    if verified == Some(false) {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+/// get-objects: reads the `--count` objects `put-objects` wrote (`<key>-<index>`,
+/// `--size` bytes each) over NIXL into their slices of one registered buffer,
+/// `--parallel` in flight; `--verify` checks every slice against the content
+/// `put-objects` wrote.
+async fn run_get_objects(
+    args: &Args,
+    client: &reqwest::Client,
+    creds: &sigv4::Credentials,
+    url: &Url,
+) -> Result<()> {
+    let (size, count) = (args.size, args.count);
+    if size == 0 || count == 0 || size % 8 != 0 {
+        bail!("--size must be a positive multiple of 8 and --count positive");
+    }
+    let total = size * count;
+    let agent_name = if args.agent.is_empty() {
+        format!("nixl-gets-{}", std::process::id())
+    } else {
+        args.agent.clone()
+    };
+    let agent = Agent::new(&agent_name).map_err(|e| anyhow!("agent: {e}"))?;
+    let mut params =
+        Params::from(std::iter::empty::<(&str, &str)>()).map_err(|e| anyhow!("params: {e}"))?;
+    if !args.devices.is_empty() {
+        params
+            .set("device_list", &args.devices)
+            .map_err(|e| anyhow!("device_list: {e}"))?;
+    }
+    let backend = agent
+        .create_backend("UCX", &params)
+        .map_err(|e| anyhow!("ucx backend: {e}"))?;
+    let mut opt_args = OptArgs::new().map_err(|e| anyhow!("opt args: {e}"))?;
+    opt_args
+        .add_backend(&backend)
+        .map_err(|e| anyhow!("opt args: {e}"))?;
+    let buffer = match args.mem.as_str() {
+        "gpu" | "vram" => Buffer::gpu(total, args.gpu)?,
+        _ => Buffer::host(total)?,
+    };
+    let _registration = agent
+        .register_memory(&buffer, Some(&opt_args))
+        .map_err(|e| anyhow!("register memory: {e}"))?;
+    let metadata = base64::engine::general_purpose::STANDARD
+        .encode(agent.get_local_md().map_err(|e| anyhow!("metadata: {e}"))?);
+    let kind = if matches!(buffer.mem_type, MemType::Vram) {
+        "vram"
+    } else {
+        "dram"
+    };
+    let object_url = |index: usize| -> Result<Url> {
+        let base = url.as_str().trim_end_matches('/');
+        Ok(Url::parse(&format!("{base}-{index:05}"))?)
+    };
+    eprintln!(
+        "{count} objects of {size} bytes, {} in flight, agent {agent_name}, buffer {}",
+        args.parallel,
+        buffer.header()
+    );
+
+    if let Some(start_at) = args.start_at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        if start_at > now {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(start_at - now)).await;
+        }
+    }
+    let epoch = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    };
+    let first_start = epoch();
+    let mut last_end = first_start;
+    let mut last = None;
+    let mut latencies_ms = Vec::with_capacity(count * args.rounds);
+    for round in 0..args.rounds {
+        let started = Instant::now();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(args.parallel.max(1)));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..count {
+            let permit = std::sync::Arc::clone(&semaphore).acquire_owned().await?;
+            let target = object_url(index)?;
+            let extra = vec![
+                ("x-rustfs-nixl-agent".to_owned(), agent_name.clone()),
+                ("x-rustfs-nixl-metadata".to_owned(), metadata.clone()),
+                (
+                    "x-rustfs-nixl-buffer".to_owned(),
+                    format!(
+                        "{kind}:{}:{:#x}:{size}",
+                        buffer.device,
+                        buffer.addr + index * size
+                    ),
+                ),
+            ];
+            let (client, creds) = (
+                client.clone(),
+                sigv4::Credentials {
+                    access_key: creds.access_key.clone(),
+                    secret_key: creds.secret_key.clone(),
+                    region: creds.region.clone(),
+                },
+            );
+            tasks.spawn(async move {
+                let _permit = permit;
+                let object_started = Instant::now();
+                let (reply, body) = request(&client, &creds, "GET", &target, &extra).await?;
+                if reply.status != 200
+                    || reply.rdma_reply.is_none()
+                    || reply.transferred != Some(size as u64)
+                {
+                    bail!(
+                        "GetObject {index} returned {} (rdma reply {:?}, moved {:?}): {}",
+                        reply.status,
+                        reply.rdma_reply,
+                        reply.transferred,
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+                Ok::<_, anyhow::Error>(object_started.elapsed().as_secs_f64() * 1000.0)
+            });
+        }
+        while let Some(done) = tasks.join_next().await {
+            latencies_ms.push(done??);
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        println!(
+            "round {round}: objects={count} seconds={seconds:.3} GBps={:.2} objects_per_s={:.0}",
+            total as f64 / seconds / 1e9,
+            count as f64 / seconds
+        );
+        last = Some(seconds);
+        last_end = epoch();
+    }
+
+    let mut verified = None;
+    if args.verify {
+        let ours = buffer.to_host()?;
+        let mut expected = vec![0u8; size];
+        let mut wrong = 0usize;
+        for index in 0..count {
+            fill_pattern(&mut expected, index * size);
+            if ours[index * size..(index + 1) * size] != expected[..] {
+                wrong += 1;
+            }
+        }
+        if wrong > 0 {
+            println!("MISMATCH wrong_objects={wrong} of {count}");
+        }
+        verified = Some(wrong == 0);
+    }
+    latencies_ms.sort_by(f64::total_cmp);
+    let percentile = |p: f64| {
+        latencies_ms
+            .get(((latencies_ms.len() as f64 - 1.0) * p).round() as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
+    let seconds = last.unwrap_or(0.0);
+    println!(
+        "RESULT {} op=get-objects size={total} objects={count} object_size={size} seconds={seconds:.3} GBps={:.2} objects_per_s={:.0} p50_ms={:.1} p99_ms={:.1} mem={} verified={} rounds={} start={first_start:.3} end={last_end:.3}",
+        if verified != Some(false) { "OK" } else { "MISMATCH" },
+        total as f64 / seconds / 1e9,
+        count as f64 / seconds,
+        percentile(0.5),
+        percentile(0.99),
         args.mem,
         verified.map_or("skipped".to_owned(), |v| v.to_string()),
         args.rounds,
