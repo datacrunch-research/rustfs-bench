@@ -73,6 +73,10 @@ struct Args {
     /// put-objects: number of objects (keys `<key>-<index>`)
     #[arg(long, default_value_t = 1)]
     count: usize,
+    /// put-objects --verify: the hash behind the server's ETag, `md5` or
+    /// `xxh3` (RUSTFS_OBJECT_ETAG_ALGORITHM=xxh3, XXH3-128)
+    #[arg(long, default_value = "md5")]
+    etag: String,
     /// PUT: multipart part size in bytes (96 MiB = two 12+4 stripes of 4 MiB shards)
     #[arg(long, default_value_t = 96 << 20)]
     part_size: usize,
@@ -921,8 +925,13 @@ async fn run_put_objects(
                 wrong += 1;
                 same = false;
             }
-            // The PUT's ETag must be the MD5 of the object's bytes.
-            let expected = format!("\"{}\"", hex_string(&Md5::digest(slice)));
+            // The PUT's ETag must be the MD5 (or XXH3-128) of the object's bytes.
+            let digest = if args.etag == "xxh3" {
+                xxhash_rust::xxh3::xxh3_128(slice).to_be_bytes().to_vec()
+            } else {
+                Md5::digest(slice).to_vec()
+            };
+            let expected = format!("\"{}\"", hex_string(&digest));
             if etags[index].as_deref() != Some(expected.as_str()) {
                 wrong_etags += 1;
                 same = false;

@@ -18,6 +18,7 @@ hex = "0.4"
 hmac = "0.12"
 libloading = "0.8"
 md-5 = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 nixl-sys = { git = "https://github.com/ai-dynamo/nixl", tag = "v1.5.2" }
 reqwest = { version = "0.12", default-features = false, features = ["http2"] }
 sha2 = "0.10"
